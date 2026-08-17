@@ -50,13 +50,10 @@ def _resolve_output_device(
     if preference != OutputDevice.AUTO.value:
         raise ValueError(f"Unsupported output device: {preference}")
 
-    # Keeping an already-CUDA IMAGE on the same device avoids a pointless full-video
-    # round trip through system RAM. For CPU inputs, only choose CUDA when the full
-    # result, one float32 input/output scratch frame, and a conservative CUDA
-    # headroom all fit in currently free VRAM.
-    if images.device.type == "cuda":
-        return cuda_device
-
+    # Auto always checks the *new* complete output against currently free VRAM.
+    # This remains necessary when the input itself is already CUDA: a downstream
+    # 2x VSR output is 4x the input pixel storage and can otherwise turn a useful
+    # zero-copy chain into a GPU OOM.
     try:
         free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
     except Exception:
