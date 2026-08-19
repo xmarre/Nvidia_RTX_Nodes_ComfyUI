@@ -184,12 +184,16 @@ class RTXVideoSuperResolution(io.ComfyNode):
                     .to(device=cuda_device, dtype=torch.float32)
                     .contiguous()
                 )
-                dlpack_out = sr.run(input_frame).image
-                output_frame = torch.from_dlpack(dlpack_out).movedim(0, -1)
+                result = sr.run(input_frame)
+                dlpack_out = result.image
+                # NVVFX owns the DLPack-backed storage and may reuse/free it on
+                # the next run() or when the effect closes. Clone immediately so
+                # all downstream copies read from PyTorch-owned storage.
+                output_frame = torch.from_dlpack(dlpack_out).clone().movedim(0, -1)
                 out_tensor[index].copy_(
                     output_frame.to(device=result_device, dtype=images.dtype)
                 )
-                del input_frame, output_frame, dlpack_out
+                del input_frame, output_frame, dlpack_out, result
 
         return io.NodeOutput(out_tensor)
 
