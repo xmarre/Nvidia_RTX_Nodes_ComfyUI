@@ -50,7 +50,7 @@ def _resolve_output_device(
     if preference != OutputDevice.AUTO.value:
         raise ValueError(f"Unsupported output device: {preference}")
 
-    # Auto always checks the *new* complete output against currently free VRAM.
+    # Auto checks the complete output against free VRAM after NVVFX has loaded.
     # This remains necessary when the input itself is already CUDA: a downstream
     # 2x VSR output is 4x the input pixel storage and can otherwise turn a useful
     # zero-copy chain into a GPU OOM.
@@ -60,10 +60,16 @@ def _resolve_output_device(
         return torch.device("cpu")
 
     _, output_height, output_width, channels = output_shape
+    input_frame_shape = (1, int(images.shape[1]), int(images.shape[2]), int(images.shape[3]))
+    output_frame_shape = (1, output_height, output_width, channels)
     output_bytes = _tensor_nbytes(output_shape, images.dtype)
+    # Peak frame scratch while cloning the effect-owned DLPack result consists
+    # of one float32 input frame plus both the NVVFX output and its owned clone.
+    # The final copy writes directly into out_tensor, including dtype conversion,
+    # so it does not create another full-size converted output tensor.
     scratch_bytes = (
-        int(images.shape[1]) * int(images.shape[2]) * int(images.shape[3]) * 4
-        + output_height * output_width * channels * 4
+        _tensor_nbytes(input_frame_shape, torch.float32)
+        + 2 * _tensor_nbytes(output_frame_shape, torch.float32)
     )
     headroom = max(
         _AUTO_CUDA_MIN_HEADROOM,
@@ -153,7 +159,6 @@ class RTXVideoSuperResolution(io.ComfyNode):
         output_width = max(8, round(output_width / 8) * 8)
         output_height = max(8, round(output_height / 8) * 8)
         output_shape = (int(frame_count), output_height, output_width, int(c))
-        result_device = _resolve_output_device(images, output_shape, output_device)
 
         quality_mapping = {
             "LOW": nvvfx.effects.QualityLevel.LOW,
@@ -169,6 +174,10 @@ class RTXVideoSuperResolution(io.ComfyNode):
             sr.output_height = output_height
             sr.load()
 
+            # Resolve auto after the effect is loaded so its resident allocations
+            # are already reflected in the free-VRAM measurement.
+            result_device = _resolve_output_device(images, output_shape, output_device)
+
             # The returned IMAGE must be one contiguous tensor, but there is no reason
             # to pre-stage a multi-frame float32 CUDA batch as well. Process exactly one
             # frame at a time so temporary memory is O(one frame) instead of O(batch).
@@ -178,11 +187,14 @@ class RTXVideoSuperResolution(io.ComfyNode):
                 dtype=images.dtype,
             )
             for index in range(int(frame_count)):
-                input_frame = (
-                    images[index]
-                    .movedim(-1, 0)
-                    .to(device=cuda_device, dtype=torch.float32)
-                    .contiguous()
+                # copy=True plus contiguous_format produces exactly one owned,
+                # contiguous float32 CUDA input frame even when the source is a
+                # non-contiguous movedim view or already lives on CUDA.
+                input_frame = images[index].movedim(-1, 0).to(
+                    device=cuda_device,
+                    dtype=torch.float32,
+                    memory_format=torch.contiguous_format,
+                    copy=True,
                 )
                 result = sr.run(input_frame)
                 dlpack_out = result.image
@@ -190,9 +202,9 @@ class RTXVideoSuperResolution(io.ComfyNode):
                 # the next run() or when the effect closes. Clone immediately so
                 # all downstream copies read from PyTorch-owned storage.
                 output_frame = torch.from_dlpack(dlpack_out).clone().movedim(0, -1)
-                out_tensor[index].copy_(
-                    output_frame.to(device=result_device, dtype=images.dtype)
-                )
+                # copy_ supports cross-device and dtype conversion, avoiding a
+                # separate full-size output_frame.to(...) temporary on CUDA.
+                out_tensor[index].copy_(output_frame)
                 del input_frame, output_frame, dlpack_out, result
 
         return io.NodeOutput(out_tensor)
