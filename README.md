@@ -14,4 +14,4 @@ High-resolution video outputs can be much larger than their inputs. The node pro
 - `cuda`: always keep the complete result in VRAM. This is useful for large video chains when VRAM is plentiful and avoids materializing another full-resolution tensor in system RAM.
 - `cpu`: preserve host-memory output behavior.
 
-Common video encoders such as VideoHelperSuite consume CUDA `IMAGE` tensors frame by frame and transfer individual frames to CPU while encoding, so a CUDA result does not require a second full-video CPU copy there.
+VideoHelperSuite's standard FFmpeg path iterates `IMAGE` frames and converts each frame to CPU individually before writing it to FFmpeg. With that path, a CUDA result avoids materializing a second complete full-resolution floating-point video tensor in system RAM. Formats that require their own pre-pass may retain encoded frame bytes separately.
